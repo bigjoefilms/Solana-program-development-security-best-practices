@@ -1,4 +1,6 @@
 # A Practical Guide to Solana Smart Contract Security
+![Alt text](/images/banner.png)
+
 
 [![Twitter URL](https://img.shields.io/twitter/url/https/twitter.com/slowmist_team.svg?style=social&label=Follow%20%40bigjoejs)](https://x.com/bigjoejs)
 
