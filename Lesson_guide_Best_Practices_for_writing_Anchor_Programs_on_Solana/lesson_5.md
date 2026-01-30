@@ -1,39 +1,81 @@
-## 4.⁠ ⁠Use PDAs (Program Derived Addresses) correctly with seeds and bumps  
+## 4: Use PDAs (Program Derived Addresses) Correctly with Seeds and Bumps
 
+The Problem
+Many developers new to Solana create programs that don't properly validate account ownership or use secure account derivation. This can lead to unauthorized access and fund drainage attacks.
+### Vulnerable Example
 ```rs
+use anchor_lang::prelude::*;
 
-use anchor_lang::{prelude::*, system_program::{Transfer, transfer}};
-
-declare_id!("DnQBHsS7uRgtxXAb5FHQdfmZCKf3mp9VgvNWotK5BK7L");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
-pub mod anchor_vault {
+mod vulnerable_vault {
     use super::*;
-
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        ctx.accounts.initialize(&ctx.bumps)?;
-
+    
+    pub fn initialize(ctx: Context<Initialize>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.owner = ctx.accounts.user.key();
+        vault.balance = amount;
         Ok(())
     }
-
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        ctx.accounts.deposit(amount)?;
-
-        Ok(())
-    }
-
+    
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        ctx.accounts.withdraw(amount)?;
-
-        Ok(())
-    }
-
-    pub fn close(ctx: Context<Close>) -> Result<()> {
-        ctx.accounts.close()?;
-
+        // ❌ NO validation that vault belongs to this user!
+        let vault = &mut ctx.accounts.vault;
+        vault.balance -= amount;
         Ok(())
     }
 }
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(init, payer = user, space = 8 + 32 + 8)]
+    pub vault: Account<'info, Vault>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub vault: Account<'info, Vault>, // ❌ Anyone can pass any vault!
+}
+
+#[account]
+pub struct Vault {
+    pub owner: Pubkey,
+    pub balance: u64,
+}
+
+```
+The Vulnerability: An attacker can call withdraw() with any vault account, not just their own, because there's no cryptographic link between the user and the vault.
+### Secure Example with PDAs
+```rs
+use anchor_lang::prelude::*;
+
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+
+#[program]
+mod secure_vault {
+    use super::*;
+    
+    pub fn initialize(ctx: Context<Initialize>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.owner = ctx.accounts.user.key();
+        vault.balance = amount;
+        vault.bump = ctx.bumps.vault; // ✅ Store bump for future use
+        Ok(())
+    }
+    
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.balance -= amount;
+        Ok(())
+    }
+}
+
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(mut)]
@@ -41,77 +83,12 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"state", user.key().as_ref()], 
-        bump,
-        space = VaultState::INIT_SPACE,
+        space = 8 + 32 + 8 + 1,
+        seeds = [b"vault", user.key().as_ref()], // ✅ Deterministic PDA
+        bump
     )]
-    pub vault_state: Account<'info, VaultState>,
-    #[account(
-        mut,
-        seeds = [b"vault", vault_state.key().as_ref()],
-        bump,
-    )]
-    pub vault: SystemAccount<'info>,
+    pub vault: Account<'info, Vault>,
     pub system_program: Program<'info, System>,
-}
-
-impl<'info> Initialize<'info> {
-    pub fn initialize(&mut self, bumps: &InitializeBumps) -> Result<()> {
-        // Get the amount of lamports needed to make the vault rent exempt
-        let rent_exempt = Rent::get()?.minimum_balance(self.vault.to_account_info().data_len());
-
-        // Transfer the rent-exempt amount from the user to the vault
-        let cpi_program = self.system_program.to_account_info();
-        let cpi_accounts = Transfer {
-            from: self.user.to_account_info(),
-            to: self.vault.to_account_info(),
-        };
-
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-        transfer(cpi_ctx, rent_exempt)?;
-
-        self.vault_state.vault_bump = bumps.vault;
-        self.vault_state.state_bump = bumps.vault_state;
-
-        Ok(())
-    }  
-}
-
-#[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"vault", vault_state.key().as_ref()], 
-        bump = vault_state.vault_bump,
-    )]
-    pub vault: SystemAccount<'info>,
-    #[account(
-        seeds = [b"state", user.key().as_ref()],
-        bump = vault_state.state_bump,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-    pub system_program: Program<'info, System>,
-}
-
-impl<'info> Deposit<'info> {
-    pub fn deposit(&mut self, amount: u64) -> Result<()> {
-
-        let cpi_program = self.system_program.to_account_info();
-
-        let cpi_accounts = Transfer {
-            from: self.user.to_account_info(),
-            to: self.vault.to_account_info(),
-        };
-
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-        transfer(cpi_ctx, amount)?;
-
-        Ok(())
-    }
 }
 
 #[derive(Accounts)]
@@ -120,94 +97,29 @@ pub struct Withdraw<'info> {
     pub user: Signer<'info>,
     #[account(
         mut,
-        seeds = [b"vault", vault_state.key().as_ref()],
-        bump = vault_state.vault_bump,
+        seeds = [b"vault", user.key().as_ref()], // ✅ Must match user
+        bump = vault.bump,
+        has_one = owner @ ErrorCode::Unauthorized
     )]
-    pub vault: SystemAccount<'info>,
-    #[account(
-        seeds = [b"state", user.key().as_ref()],
-        bump = vault_state.state_bump,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-    pub system_program: Program<'info, System>,
+    pub vault: Account<'info, Vault>,
 }
 
-impl<'info> Withdraw<'info> {
-    pub fn withdraw(&mut self, amount: u64) -> Result<()> {
-        let cpi_program = self.system_program.to_account_info();
-
-        let cpi_accounts = Transfer {
-            from: self.vault.to_account_info(),
-            to: self.user.to_account_info(),
-        };
-
-        let seeds = &[
-            b"vault",
-            self.vault_state.to_account_info().key.as_ref(),
-            &[self.vault_state.vault_bump],
-        ];
-
-        let signer_seeds = &[&seeds[..]];
-
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
-        transfer(cpi_ctx, amount)?;
-
-        Ok(())
-    }
-}
-
-#[derive(Accounts)]
-pub struct Close<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"vault", vault_state.key().as_ref()],
-        bump = vault_state.vault_bump,
-    )]
-    pub vault: SystemAccount<'info>,
-    #[account(
-        mut,
-        seeds = [b"state", user.key().as_ref()],
-        bump = vault_state.state_bump,
-        close = user,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-    pub system_program: Program<'info, System>,
-}
-
-impl<'info> Close<'info> {
-    pub fn close(&mut self) -> Result<()> {
-        let cpi_program = self.system_program.to_account_info();
-
-        let cpi_accounts = Transfer {
-            from: self.vault.to_account_info(),
-            to: self.user.to_account_info(),
-        };
-
-        let seeds = &[
-            b"vault",
-            self.vault_state.to_account_info().key.as_ref(),
-            &[self.vault_state.vault_bump],
-        ];
-
-        let signer_seeds = &[&seeds[..]];
-
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
-        transfer(cpi_ctx, self.vault.lamports())?;
-
-        Ok(())
-    }
-}
 #[account]
-pub struct VaultState {
-    pub vault_bump: u8,
-    pub state_bump: u8,
+pub struct Vault {
+    pub owner: Pubkey,
+    pub balance: u64,
+    pub bump: u8, // ✅ Store bump to avoid recomputation
 }
 
-impl Space for VaultState {
-    const INIT_SPACE: usize = 8 + 1 + 1;
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Unauthorized access")]
+    Unauthorized,
 }
-```
+
+Key Takeaways
+- Use PDAs with seeds: Derive accounts deterministically using seeds = [b"vault", user.key().as_ref()]
+-  Store the bump: Save bump in your account to avoid recalculating it
+-  Validate ownership: Use has_one = owner to ensure the signer owns the account
+-  Add proper space: Include bump in space calculation (8 + 32 + 8 + 1)
+PDAs ensure only the rightful owner can interact with their accounts—no one can substitute a different vault address.
